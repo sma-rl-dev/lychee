@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "app": "lychee",
+  "requirements": {
+    "second-user": {
+      "status": "present",
+      "evidence": "Seed creates regular user mara / tester1234 (may_upload, may_edit_own_settings, not admin) via POST /api/v2/UserManagement. Verify asserts users == [admin, mara]."
+    },
+    "nested-albums": {
+      "status": "present",
+      "evidence": "Album Nordic Coast 2026 has child album Lofoten Islands; lychee:sync builds the tree from the fixture directories and verify reads it back through /api/v2/Album::albums."
+    },
+    "shared-album": {
+      "status": "present",
+      "evidence": "Studio Sessions is shared with mara with grants_edit/grant_download; verify reads /api/v2/Sharing?album_id=... and confirms mara sees the album in shared_albums and can list its 4 photos."
+    },
+    "public-album": {
+      "status": "present",
+      "evidence": "Archive 2024 is public (is_public, no link requirement): a guest session gets Album::head 200 with 4 photos and Album::photos total=4."
+    },
+    "photo-metadata": {
+      "status": "present",
+      "evidence": "17 photos with fixed titles (fixture filenames), descriptions (4 empty as a realistic edge case), unique tag sets, and taken/upload dates in 2024 and 2026 fixed through PATCH /api/v2/Photo."
+    },
+    "photo-ratings": {
+      "status": "present",
+      "evidence": "Admin ratings 0-5 across the 17 photos via Photo::setRating; verify asserts per-photo rating_user."
+    },
+    "highlighted-photos": {
+      "status": "present",
+      "evidence": "4 photos flagged is_highlighted (former is_starred) through Photo::highlight; verify asserts the exact 4 titles."
+    },
+    "empty-unsorted": {
+      "status": "present",
+      "evidence": "All photos land in fixture albums; verify asserts the Unsorted smart album total is 0."
+    },
+    "client-side-favourites": {
+      "status": "not_seedable",
+      "evidence": "Lychee v7 favourites are a client-side persisted store (resources/js/stores/FavouriteState.ts); server-side metrics that count them are disabled by default and skip admins. Assert favourites only after a browser user action, never as seeded baseline."
+    }
+  }
+}

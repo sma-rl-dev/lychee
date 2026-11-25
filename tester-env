@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Lychee - Tester Environment CLI
+# Editable-source, single-service deployment: upstream multi-stage Dockerfile,
+# SQLite on a named volume, QUEUE_CONNECTION=sync, AI vision disabled.
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy (start), seed, verify, reset, stop, status, url, logs, help
+
+RUN_ID="default"
+PORT="8157"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-lychee}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+# Fixed 32-byte key so sessions, encrypted cookies and seeded state survive a
+# container recreate on the same data volume.
+APP_KEY="base64:oiyf/ofQ6qYpwuz8mIl/yY5M01rSbW+oVBss+mDTeVk="
+ADMIN_USER="${ADMIN_USER:-admin}"
+ADMIN_PASS="${ADMIN_PASS:-tester1234}"
+# Fixture directory imported by `seed` (mounted read-only at /seed).
+SEED_DIR="${LYCHEE_SEED_DIR:-${SCRIPT_DIR}/seed/photos}"
+SEED_SCRIPT="${SCRIPT_DIR}/tester-env-seed.py"
+
+suffix=""
+refresh_names() {
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    CONTAINER_NAME="tester-env-lychee${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-lychee:dev}"
+    DATA_VOLUME="lychee-data${suffix}"
+    UPLOADS_VOLUME="lychee-uploads${suffix}"
+
+    # Lychee bakes APP_URL into the SPA <base href> and into every absolute media
+    # URL (config/filesystems.php: uploads url = APP_URL + /uploads), so it must be
+    # the origin the browser actually visits. Inside a container localhost is the
+    # browser itself, so a manual run defaults to the Docker bridge gateway the
+    # runner uses; scripts/rl-env passes the real origin as TESTER_ENV_BROWSER_ORIGIN.
+    local origin="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-}}"
+    if [[ -z "${origin}" ]]; then
+        local gw="${TESTER_ENV_HOST_GATEWAY:-}"
+        if [[ -z "${gw}" ]]; then
+            gw="$(ip -4 addr show dev docker0 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
+        fi
+        origin="http://${gw:-172.17.0.1}:${PORT}"
+    fi
+    APP_URL="${origin}"
+}
+
+COOKIE_JAR=""
+
+run_labels() {
+    echo --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}"
+}
+
+wait_ready() {
+    echo "==> Waiting for ${CONTAINER_NAME} at http://localhost:${PORT}/ ..."
+    local i
+    for i in $(seq 1 60); do
+        if curl -fs -o /dev/null "http://localhost:${PORT}/login"; then
+            echo "==> Server is up."
+            return 0
+        fi
+        sleep 2
+    done
+    echo "Server did not become ready in time." >&2
+    docker logs --tail 40 "${CONTAINER_NAME}" >&2 || true
+    return 1
+}
+
+url_decode() {
+    printf '%s' "$1" | sed 's/%3D/=/g; s/%2F/\//g; s/%2B/+/g'
+}
+
+# Lychee's API group validates the CSRF token on every request, including GETs.
+xsrf_token() {
+    url_decode "$(awk '$6 == "XSRF-TOKEN" {print $7}' "${COOKIE_JAR}")"
+}
+
+# Logs in through the SPA's own API (CSRF cookie dance) and returns 0 on 204.
+api_login() {
+    COOKIE_JAR="$(mktemp)"
+    local token code
+    curl -fs -c "${COOKIE_JAR}" -o /dev/null "http://localhost:${PORT}/"
+    token="$(xsrf_token)"
+    code="$(curl -s -b "${COOKIE_JAR}" -c "${COOKIE_JAR}" -o /dev/null -w '%{http_code}' \
+        -H 'Accept: application/json' -H 'Content-Type: application/json' \
+        -H "X-XSRF-TOKEN: ${token}" -X POST \
+        "http://localhost:${PORT}/api/v2/Auth::login" \
+        -d "{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASS}\"}")"
+    [[ "${code}" == "204" ]]
+}
+
+db_counts() {
+    docker exec -u www-data "${CONTAINER_NAME}" php -r \
+        '$p = new PDO("sqlite:/data/database.sqlite");
+         foreach (["users", "albums", "photos"] as $t) {
+             echo $t . "=" . $p->query("select count(*) from " . $t)->fetchColumn() . " ";
+         }
+         echo "\n";'
+}
+
+cmd_deploy() {
+    echo "==> Building ${IMAGE_NAME} from editable source @$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)..."
+    docker build $(run_labels) -f "${SCRIPT_DIR}/Dockerfile" -t "${IMAGE_NAME}" "${SCRIPT_DIR}"
+
+    echo "==> Ensuring volumes ${DATA_VOLUME}, ${UPLOADS_VOLUME}..."
+    docker volume create $(run_labels) "${DATA_VOLUME}" >/dev/null
+    docker volume create $(run_labels) "${UPLOADS_VOLUME}" >/dev/null
+
+    # Laravel's SQLite connector refuses a missing database file; the entrypoint
+    # chowns /data to www-data on every start, so root may create it here.
+    docker run --rm --user 0 -v "${DATA_VOLUME}:/data" --entrypoint /bin/sh \
+        "${IMAGE_NAME}" -c 'touch /data/database.sqlite && chown www-data:www-data /data/database.sqlite'
+
+    echo "==> (Re)starting container ${CONTAINER_NAME} on port ${PORT}..."
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    local seed_mount=()
+    if [[ -d "${SEED_DIR}" ]]; then
+        seed_mount=(-v "${SEED_DIR}:/seed:ro")
+        echo "==> Seed fixtures: ${SEED_DIR} -> /seed (read-only)"
+    fi
+    docker run -d --name "${CONTAINER_NAME}" \
+        $(run_labels) \
+        -p "${PORT}:8000" \
+        -v "${DATA_VOLUME}:/data" \
+        -v "${UPLOADS_VOLUME}:/app/public/uploads" \
+        "${seed_mount[@]}" \
+        -e APP_NAME=Lychee \
+        -e APP_ENV=production \
+        -e APP_DEBUG=false \
+        -e APP_KEY="${APP_KEY}" \
+        -e APP_URL="${APP_URL}" \
+        -e DB_CONNECTION=sqlite \
+        -e DB_DATABASE=/data/database.sqlite \
+        -e QUEUE_CONNECTION=sync \
+        -e CACHE_STORE=file \
+        -e SESSION_DRIVER=file \
+        -e AI_VISION_ENABLED=false \
+        "${IMAGE_NAME}" >/dev/null
+
+    wait_ready
+
+    if api_login; then
+        echo "==> Admin ${ADMIN_USER} already present (login OK)."
+    else
+        echo "==> Creating admin ${ADMIN_USER} via docker/scripts/create-admin-user.sh..."
+        docker exec -u www-data \
+            -e ADMIN_USER="${ADMIN_USER}" -e ADMIN_PASSWORD="${ADMIN_PASS}" \
+            "${CONTAINER_NAME}" /usr/local/bin/create-admin-user.sh
+        api_login || { echo "Admin login failed after creation." >&2; exit 1; }
+        echo "==> Admin created and login verified."
+    fi
+
+    echo "==> Deployment complete."
+    echo "    URL:      ${APP_URL}"
+    echo "    Local:    http://localhost:${PORT}"
+    echo "    Login:    ${ADMIN_USER} / ${ADMIN_PASS}"
+    if [[ -n "${TESTER_ENV_BROWSER_ORIGIN:-}" ]]; then
+        echo "    Browser MCP: http://host.docker.internal:${PORT}/"
+    fi
+}
+
+cmd_seed() {
+    if [[ ! -d "${SEED_DIR}" ]]; then
+        echo "Missing fixture directory ${SEED_DIR} (set LYCHEE_SEED_DIR)." >&2
+        exit 1
+    fi
+    if ! docker exec "${CONTAINER_NAME}" test -d /seed 2>/dev/null; then
+        echo "/seed is not mounted in ${CONTAINER_NAME}; re-run deploy with SEED_DIR present." >&2
+        exit 1
+    fi
+    # One `lychee:sync` per top-level entry: directories become albums (nested
+    # subdirectories become child albums), owned by the first (admin) user.
+    # Photo titles default to the filename stem, so the fixture filenames are
+    # the seeded titles. Re-running skips duplicates.
+    local entry
+    while IFS= read -r entry; do
+        echo "==> lychee:sync /seed/${entry}"
+        docker exec -u www-data "${CONTAINER_NAME}" \
+            php artisan lychee:sync "/seed/${entry}" --owner_id=1 --skip_duplicates=1
+    done < <(docker exec "${CONTAINER_NAME}" ls -A /seed)
+
+    # Fixed metadata/look: album descriptions, fixed taken/upload dates, tags,
+    # ratings, highlights, the mara user, one shared album and one public album.
+    python3 "${SEED_SCRIPT}" seed --api "http://localhost:${PORT}/api/v2"
+
+    echo "==> Seed complete: $(db_counts)"
+}
+
+cmd_verify() {
+    wait_ready
+    python3 "${SEED_SCRIPT}" verify \
+        --api "http://localhost:${PORT}/api/v2" --app-url "${APP_URL}"
+}
+
+cmd_reset() {
+    echo "==> Removing container ${CONTAINER_NAME} and volumes (image kept)..."
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker volume rm "${DATA_VOLUME}" "${UPLOADS_VOLUME}" >/dev/null 2>&1 || true
+    echo "==> Reset complete. Run 'deploy' for a clean install."
+}
+
+cmd_stop() {
+    echo "==> Stopping ${CONTAINER_NAME} (data preserved)..."
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}" 2>&1 || echo "Container not running."
+}
+
+cmd_url() {
+    echo "${APP_URL}"
+}
+
+cmd_status() {
+    if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
+        echo "Status: RUNNING"
+        echo "URL: ${APP_URL}"
+        echo "Local: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Volumes: ${DATA_VOLUME} (/data), ${UPLOADS_VOLUME} (/app/public/uploads)"
+        echo "Login: ${ADMIN_USER} / ${ADMIN_PASS}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Lychee - Tester Environment CLI (SQLite single service, editable source)
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the upstream Dockerfile, start the container, create the admin
+            (alias: start)
+  seed      Import seed/photos with lychee:sync, then apply the fixed metadata
+            (descriptions, dates, tags, ratings, highlights, mara user, sharing,
+            public album) through the app API
+  verify    Assert the seeded library (albums, photos, tags, ratings, sharing,
+            public access, media URLs) through the app API
+  reset     Remove container and data volumes (image kept)
+  stop      Stop the container (data preserved)
+  status    Show container state, port and volumes
+  url       Print the app URL (browser-origin aware)
+  logs      Tail container logs
+  help      Show this help
+
+Env vars:
+  IMAGE_TAG                 Content-addressed image tag exported by scripts/rl-env
+  RUN_ID / --run-id         Scope container and volume names
+  TESTER_ENV_BROWSER_ORIGIN Browser-visible origin; becomes APP_URL (the SPA
+                            base href and every media URL). Defaults to the
+                            Docker bridge gateway origin, not localhost, because
+                            inside a container localhost is the browser itself.
+  LYCHEE_SEED_DIR           Fixture dir mounted read-only at /seed
+                            (default seed/photos)
+  ADMIN_USER / ADMIN_PASS   Deterministic admin (default admin / tester1234)
+
+Deployment shape:
+  APP_ENV=production, DB_CONNECTION=sqlite (DB_DATABASE=/data/database.sqlite),
+  QUEUE_CONNECTION=sync, AI_VISION_ENABLED=false, V8_ENABLED default (v7 UI).
+  Volumes: lychee-data -> /data, lychee-uploads -> /app/public/uploads.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    for ((i = 2; i <= $#; i++)); do
+        local arg="${!i}"
+        local next=$((i + 1))
+        case "${arg}" in
+            --run-id) RUN_ID="${!next}"; ((i++)) ;;
+            --port) PORT="${!next}"; ((i++)) ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Unknown option: ${arg}" >&2; exit 1 ;;
+        esac
+    done
+    refresh_names
+
+    case "${cmd}" in
+        deploy|start) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        status) cmd_status ;;
+        url) cmd_url ;;
+        logs) cmd_logs ;;
+        help) cmd_help ;;
+        *) echo "Unknown command: ${cmd}" >&2; cmd_help >&2; exit 1 ;;
+    esac
+}
+
+main "$@"
