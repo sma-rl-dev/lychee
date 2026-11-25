@@ -115,6 +115,23 @@ reproduce the same signature (observed `8bcc58001dee8c78`).
   shows 4 photos; Unsorted is empty.
 - `Archive 2024` opens with a guest session (public).
 
+## Fork baseline and verification evidence
+
+- Fork: `https://github.com/sma-rl-dev/lychee`, branch `tester-env-baseline`.
+- Base: upstream `v7.13.1` = `ef9339bac648a30557fb4e8dfda65af9d3e67268`, plus the app-only
+  tooling commit `271bb07acfe760f80d15a17d3b130bea9624f4fd` (this file, `tester-env`,
+  `tester-env-seed.py`, `tester-env-seed.json`, `seed/`). No upstream source is modified.
+- Determinism: `./tester-env reset && ./tester-env deploy && ./tester-env seed &&
+  ./tester-env verify` was run three times from scratch with the identical signature
+  `8bcc58001dee8c78`, and re-running `seed` on a seeded library left it unchanged.
+- Browser evidence (2026-11-25, seeded stack at `http://172.16.0.1:8157/`, admin /
+  tester1234): login landed on the populated Albums page (Nordic Coast 2026 with 5 photos
+  and child Lofoten Islands with 4, Studio Sessions 4, Archive 2024 4 public) with
+  rendered thumbnails; the `Northern Lights over Vestfjorden` detail rendered its seeded
+  metadata; the Highlighted smart album showed 4 photos and the 5-star filter returned 4;
+  the Timeline showed the 2024 and 2026 groups; a guest session on Archive 2024 saw its
+  4 photos.
+
 ## Reset
 
 ```bash
